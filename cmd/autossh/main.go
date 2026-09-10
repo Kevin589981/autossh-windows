@@ -36,6 +36,7 @@ type config struct {
 	message     string
 	pidFile     string
 	logLevel    int
+	logLevelSet bool
 	logFile     string
 }
 
@@ -173,9 +174,11 @@ func parseConfig(args []string) (config, error) {
 			return c, fmt.Errorf("invalid AUTOSSH_LOGLEVEL %q", v)
 		}
 		c.logLevel = n
+		c.logLevelSet = true
 	}
 	if os.Getenv("AUTOSSH_DEBUG") != "" {
 		c.logLevel = 7
+		c.logLevelSet = true
 	}
 	if v := os.Getenv("AUTOSSH_PORT"); v != "" {
 		p, e, err := parseMonitor(v)
@@ -281,7 +284,7 @@ func addMonitorForwards(args []string, port, echo int) []string {
 
 func newLogger(c config) (*logger, error) {
 	level := c.logLevel
-	if level == 0 {
+	if !c.logLevelSet {
 		level = 6
 	}
 	w := io.Writer(os.Stderr)
