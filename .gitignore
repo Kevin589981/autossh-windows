@@ -1,4 +1,5 @@
 autossh.exe
 autossh-test.exe
+autossh-check.exe
 *.test.exe
 *.test

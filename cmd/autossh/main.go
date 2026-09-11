@@ -19,7 +19,9 @@ import (
 	"time"
 )
 
-const version = "1.4g-windows"
+const version = "0.2.0-windows"
+
+const detachedProcess uint32 = 0x00000008 // CREATE_NEW_PROCESS_GROUP is in syscall; DETACHED_PROCESS is not.
 
 type config struct {
 	sshPath     string
@@ -77,6 +79,13 @@ func main() {
 		usage(os.Stderr)
 		os.Exit(2)
 	}
+	if cfg.background && os.Getenv("AUTOSSH_DETACHED") != "1" {
+		if err := detachSelf(); err != nil {
+			fmt.Fprintln(os.Stderr, "autossh: cannot detach:", err)
+			os.Exit(1)
+		}
+		return
+	}
 
 	l, err := newLogger(cfg)
 	if err != nil {
@@ -90,9 +99,6 @@ func main() {
 			os.Exit(1)
 		}
 		defer os.Remove(cfg.pidFile)
-	}
-	if cfg.background {
-		l.printf(1, "-f is not supported as a detached console operation on Windows; use Start-Process or a service manager")
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
@@ -109,7 +115,7 @@ func usage(w io.Writer) {
 	fmt.Fprintln(w, "usage: autossh [-V] [-f] [-M monitor[:echo]] [SSH_OPTIONS] [user@]host")
 	fmt.Fprintln(w, "Windows-native autossh supervisor. SSH options are passed through to ssh.exe.")
 	fmt.Fprintln(w, "  -M port[:echo]  enable the TCP monitor (port 0 disables it)")
-	fmt.Fprintln(w, "  -f              compatibility flag; use a Windows service/task for detaching")
+	fmt.Fprintln(w, "  -f              detach into a background Windows process")
 	fmt.Fprintln(w, "  -V              print version")
 	fmt.Fprintln(w, "Environment: AUTOSSH_PATH, AUTOSSH_PORT, AUTOSSH_POLL, AUTOSSH_FIRST_POLL,")
 	fmt.Fprintln(w, "  AUTOSSH_GATETIME, AUTOSSH_MAXSTART, AUTOSSH_MAXLIFETIME, AUTOSSH_LOGFILE,")
@@ -238,6 +244,14 @@ func parseConfig(args []string) (config, error) {
 	if c.monitor {
 		ssh = addMonitorForwards(ssh, c.monitorPort, c.echoPort)
 	}
+	if c.maxLifetime > 0 {
+		if c.poll > c.maxLifetime {
+			c.poll = c.maxLifetime
+		}
+		if c.firstPoll > c.maxLifetime {
+			c.firstPoll = c.maxLifetime
+		}
+	}
 	c.sshArgs = ssh
 	return c, nil
 }
@@ -300,11 +314,52 @@ func newLogger(c config) (*logger, error) {
 	return l, nil
 }
 
+func detachSelf() error {
+	executable, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	nullIn, err := os.OpenFile(os.DevNull, os.O_RDONLY, 0)
+	if err != nil {
+		return err
+	}
+	nullOut, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if err != nil {
+		nullIn.Close()
+		return err
+	}
+	defer nullIn.Close()
+	defer nullOut.Close()
+	cmd := exec.Command(executable, os.Args[1:]...)
+	cmd.Env = append(os.Environ(), "AUTOSSH_DETACHED=1")
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = nullIn, nullOut, nullOut
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		CreationFlags: detachedProcess | syscall.CREATE_NEW_PROCESS_GROUP,
+		HideWindow:    true,
+	}
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stdout, "autossh detached (pid %d)\n", cmd.Process.Pid)
+	return nil
+}
+
 func run(ctx context.Context, c config, l *logger) int {
 	startedAt := time.Now()
 	starts := 0
 	fastFailures := 0
 	var lastStart time.Time
+	var readListener net.Listener
+	if c.monitor && c.echoPort == 0 {
+		addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(c.monitorPort+1))
+		var err error
+		readListener, err = net.Listen("tcp", addr)
+		if err != nil {
+			l.printf(0, "cannot listen for monitor responses on %s: %v", addr, err)
+			return 1
+		}
+		defer readListener.Close()
+	}
 	for c.maxStarts < 0 || starts < c.maxStarts {
 		if c.maxLifetime > 0 && time.Since(startedAt) >= c.maxLifetime {
 			l.printf(1, "maximum lifetime reached")
@@ -328,7 +383,7 @@ func run(ctx context.Context, c config, l *logger) int {
 			return 1
 		}
 		l.printf(2, "ssh child pid is %d", cmd.Process.Pid)
-		result := watch(ctx, c, l, cmd, starts == 1, startTime, startedAt)
+		result := watch(ctx, c, l, cmd, starts == 1, startTime, startedAt, readListener)
 		if result == exitOK {
 			return 0
 		}
@@ -348,10 +403,16 @@ const (
 	exitErr
 )
 
-func watch(ctx context.Context, c config, l *logger, cmd *exec.Cmd, first bool, startTime, lifetime time.Time) watchResult {
+func watch(ctx context.Context, c config, l *logger, cmd *exec.Cmd, first bool, startTime, lifetime time.Time, readListener net.Listener) watchResult {
 	waitCh := make(chan error, 1)
 	go func() { waitCh <- cmd.Wait() }()
 	interval := c.firstPoll
+	if c.maxLifetime > 0 && time.Until(lifetime.Add(c.maxLifetime)) < interval {
+		interval = time.Until(lifetime.Add(c.maxLifetime))
+	}
+	if interval <= 0 {
+		interval = time.Millisecond
+	}
 	timer := time.NewTimer(interval)
 	defer timer.Stop()
 	for {
@@ -381,19 +442,27 @@ func watch(ctx context.Context, c config, l *logger, cmd *exec.Cmd, first bool, 
 				killTree(cmd, l)
 				return exitOK
 			}
-			if c.monitor && !monitorOK(c, l) {
+			if c.monitor && !monitorOK(c, l, readListener) {
 				l.printf(1, "monitor check failed; restarting ssh")
 				killTree(cmd, l)
 				return restart
 			}
-			timer.Reset(c.poll)
+			next := c.poll
+			if c.maxLifetime > 0 {
+				remaining := time.Until(lifetime.Add(c.maxLifetime))
+				if remaining < next {
+					next = remaining
+				}
+			}
+			if next <= 0 {
+				next = time.Millisecond
+			}
+			timer.Reset(next)
 		}
 	}
 }
 
-func (c *config) _unused() {}
-
-func monitorOK(c config, l *logger) bool {
+func monitorOK(c config, l *logger, readListener net.Listener) bool {
 	addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(c.monitorPort))
 	conn, err := net.DialTimeout("tcp", addr, 15*time.Second)
 	if err != nil {
@@ -401,10 +470,30 @@ func monitorOK(c config, l *logger) bool {
 		return false
 	}
 	defer conn.Close()
-	conn.SetDeadline(time.Now().Add(15 * time.Second))
+	deadline := time.Now().Add(15 * time.Second)
+	conn.SetDeadline(deadline)
 	msg := fmt.Sprintf("%s autossh %d %d %s\r\n", os.Getenv("COMPUTERNAME"), os.Getpid(), time.Now().UnixNano(), c.message)
 	if _, err = conn.Write([]byte(msg)); err != nil {
 		return false
+	}
+	if c.echoPort == 0 {
+		if readListener == nil {
+			return false
+		}
+		if tcpListener, ok := readListener.(*net.TCPListener); ok {
+			_ = tcpListener.SetDeadline(deadline)
+			defer tcpListener.SetDeadline(time.Time{})
+		}
+		readConn, acceptErr := readListener.Accept()
+		if acceptErr != nil {
+			l.printf(3, "monitor response accept failed: %v", acceptErr)
+			return false
+		}
+		defer readConn.Close()
+		readConn.SetDeadline(deadline)
+		buf := make([]byte, len(msg))
+		_, err = io.ReadFull(readConn, buf)
+		return err == nil && string(buf) == msg
 	}
 	buf := make([]byte, len(msg))
 	_, err = io.ReadFull(conn, buf)
