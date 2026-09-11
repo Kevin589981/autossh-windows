@@ -4,6 +4,7 @@ package main
 
 import (
 	"bufio"
+	"errors"
 	"net"
 	"os"
 	"reflect"
@@ -20,6 +21,13 @@ func TestParseMonitor(t *testing.T) {
 		if err != nil || p != tc.p || e != tc.e {
 			t.Fatalf("parseMonitor(%q) = %d:%d,%v", tc.in, p, e, err)
 		}
+	}
+}
+
+func TestParseConfigNoArgsIsDistinguished(t *testing.T) {
+	_, err := parseConfig(nil)
+	if !errors.Is(err, errDestination) {
+		t.Fatalf("expected errDestination, got %v", err)
 	}
 }
 

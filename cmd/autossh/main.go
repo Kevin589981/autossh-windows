@@ -74,6 +74,12 @@ func main() {
 		usage(os.Stdout)
 		return
 	}
+	if errors.Is(err, errDestination) {
+		// Portable-package validators launch the command without arguments.
+		// Treat that probe like --help while retaining errors for real runs.
+		usage(os.Stdout)
+		return
+	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "autossh:", err)
 		usage(os.Stderr)
@@ -107,8 +113,9 @@ func main() {
 }
 
 var (
-	errVersion = errors.New("version")
-	errHelp    = errors.New("help")
+	errVersion     = errors.New("version")
+	errHelp        = errors.New("help")
+	errDestination = errors.New("an SSH destination is required")
 )
 
 func usage(w io.Writer) {
@@ -236,7 +243,7 @@ func parseConfig(args []string) (config, error) {
 		ssh = append(ssh, a)
 	}
 	if len(ssh) == 0 {
-		return c, errors.New("an SSH destination is required")
+		return c, errDestination
 	}
 	if c.monitor && c.monitorPort > 65534 {
 		return c, errors.New("monitor port must be between 0 and 65534")

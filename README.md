@@ -77,6 +77,9 @@ port of the Unix C program.
   than a Unix `SIGTERM`.
 - Release binaries currently target Windows amd64. Go can cross-build other
   Windows architectures, but they are not attached automatically to releases.
+- Starting `autossh.exe` without arguments prints the usage text and exits
+  successfully. This makes the portable executable discoverable to package
+  managers; a real supervisor run still requires an SSH destination.
 
 The implementation follows the established autossh startup-gate and restart
 semantics while using Windows process management (`taskkill /T /F`) for child
